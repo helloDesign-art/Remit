@@ -81,9 +81,9 @@ POSTFIX_PID=$!
 
 log "relay up as ${REMIT_HOSTNAME} ($(grep -c . "$STATE/domains" || true) domains, $(grep -c . "$STATE/senders" || true) senders)"
 
-# OpenDKIM is restarted when it exits (that is how `remit render` makes it
-# reload its tables). If Postfix exits, the container exits and Docker
-# restarts it.
+# OpenDKIM is restarted if it ever exits (`remit render` reloads it with
+# SIGUSR1, so in normal operation it never does). If Postfix exits, the
+# container exits and Docker restarts it.
 while true; do
 	wait -n "$OPENDKIM_PID" "$POSTFIX_PID" 2>/dev/null || true
 	[ "$STOPPING" = 1 ] && exit 0

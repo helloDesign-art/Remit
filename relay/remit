@@ -186,10 +186,10 @@ render() {
 		if postfix status >/dev/null 2>&1; then
 			postfix reload >/dev/null 2>&1 || true
 		fi
-		# The supervisor in the entrypoint restarts OpenDKIM so it picks up
-		# the new tables.
+		# SIGUSR1 makes OpenDKIM re-read its configuration and tables without
+		# dropping the milter socket, so Postfix never sees it as down.
 		if pidof opendkim >/dev/null 2>&1; then
-			kill "$(pidof opendkim)" 2>/dev/null || true
+			kill -USR1 "$(pidof opendkim)" 2>/dev/null || true
 		fi
 	fi
 }

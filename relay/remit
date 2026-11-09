@@ -272,10 +272,14 @@ domain_check() {
 	d="${d,,}"
 	domain_exists "$d" || die "$d is not registered"
 	local ok=0
+	local relay
+	relay="$(route_get "$d" relay)"
 	local expected published
 	expected="$(dkim_public_value "$d" | grep -o 'p=[A-Za-z0-9+/=]*')"
 	published="$(dig +short TXT "${SELECTOR}._domainkey.${d}" 2>/dev/null | tr -d '" \n' | grep -o 'p=[A-Za-z0-9+/=]*' || true)"
-	if [ -n "$published" ] && [ "$published" = "$expected" ]; then
+	if [ -n "$relay" ] && ! domain_signs "$d"; then
+		note "DKIM   n/a     signed by the provider (${relay}); Remit's record is not needed"
+	elif [ -n "$published" ] && [ "$published" = "$expected" ]; then
 		note "DKIM   ok      ${SELECTOR}._domainkey.${d} matches the local key"
 	elif [ -n "$published" ]; then
 		note "DKIM   WRONG   ${SELECTOR}._domainkey.${d} is published but does not match"; ok=1
@@ -289,6 +293,20 @@ domain_check() {
 		note "SPF    missing no v=spf1 record on $d"; ok=1
 	elif [ "$spf_count" -gt 1 ]; then
 		note "SPF    INVALID $d has $spf_count SPF records; it must have exactly one"; ok=1
+	elif printf '%s' "$spf" | grep -q '\\0[0-9][0-9]'; then
+		# dig shows control characters as \NNN; a line break pasted into the
+		# record (\010) makes the whole SPF unparsable.
+		note "SPF    INVALID the record contains a line break or control character; it must be one line with spaces: $spf"; ok=1
+	elif [ -n "$relay" ]; then
+		case "$relay" in
+			*gmail.com*|*google.com*)
+				if printf '%s' "$spf" | grep -q '_spf.google.com'; then
+					note "SPF    ok      $spf (routed through Google)"
+				else
+					note "SPF    WRONG   routed through Google but include:_spf.google.com is missing: $spf"; ok=1
+				fi ;;
+			*) note "SPF    check   routed through ${relay}; make sure the provider is included: $spf" ;;
+		esac
 	elif { [ -n "${REMIT_PUBLIC_IP:-}" ] && printf '%s' "$spf" | grep -q "ip4:${REMIT_PUBLIC_IP}"; } \
 	   || printf '%s' "$spf" | grep -q "a:$(realm)"; then
 		note "SPF    ok      $spf"

@@ -1,25 +1,21 @@
 # Connecting a project
 
-Each application gets its own login and the list of domains it may send from.
+Each application is a **project**: a login and the list of domains it may
+send from.
 
-## 1. Register the domain (once per domain)
-
-```bash
-docker compose exec relay remit domain add app.example.com
-```
-
-Publish the DNS records it prints.
-
-## 2. Create the login
+## 1. Create the project
 
 ```bash
-docker compose exec relay remit sender add myapp app.example.com
+docker compose exec relay remit project add myapp app.example.com
 ```
 
-Several domains: `remit sender add myapp example.com,app.example.com`.
-The password is shown once. Store it in the application's secrets.
+Several domains: `remit project add myapp example.com,app.example.com`.
 
-## 3. Point the application at the relay
+This registers any domain that is new (generating its DKIM key and printing
+the DNS records to publish) and prints the SMTP password once. Store it in the
+application's secrets.
+
+## 2. Point the application at the relay
 
 The relay is published on Docker's `host-gateway` address. In the
 application's Compose file:
@@ -39,7 +35,7 @@ and in its configuration:
 | port | `587` |
 | encryption | none (`secure: false`, no STARTTLS) unless `REMIT_SUBMISSION_TLS=may` |
 | user | `myapp` |
-| password | from step 2 |
+| password | from step 1 |
 | from | any address at an assigned domain |
 
 The application and the relay do not share a Docker network; the connection
@@ -74,9 +70,24 @@ with smtplib.SMTP("remit", 587) as s:
 - Per-client limits: `REMIT_CLIENT_RATE_LIMIT` messages per minute, 20
   concurrent connections, 50 recipients per message, `REMIT_MESSAGE_SIZE_MB`.
 
+## Changing the domain
+
+```bash
+docker compose exec relay remit project domain add myapp new-example.com
+```
+
+Publish the DNS records it prints and check them with
+`remit project show myapp`. Switch the application's From address to
+`@new-example.com`; nothing else changes on its side. When the old domain is
+no longer used:
+
+```bash
+docker compose exec relay remit project domain remove myapp app.example.com
+```
+
 ## Rotating or removing
 
 ```bash
-docker compose exec relay remit sender passwd myapp   # new password
-docker compose exec relay remit sender remove myapp
+docker compose exec relay remit project passwd myapp   # new password
+docker compose exec relay remit project remove myapp
 ```

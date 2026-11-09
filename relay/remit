@@ -1,22 +1,36 @@
 #!/bin/bash
 # remit — operate the Remit relay from inside the container.
 #
-#   remit domain add <domain>          register a sending domain (creates its DKIM key)
+#   Projects (an application with SMTP credentials and the domains it may send from)
+#   remit project add <name> <domain>[,<domain>...]   create a project: credentials + domains + DNS records
+#   remit project domain add <name> <domain>          let the project send from one more domain (new or existing)
+#   remit project domain remove <name> <domain>       stop sending from a domain
+#   remit project show <name>                         domains, routes and live DNS status
+#   remit project passwd <name>                       rotate the SMTP password
+#   remit project list
+#   remit project remove <name>
+#
+#   Domains
+#   remit domain add <domain>          register a domain (creates its DKIM key) without assigning it
 #   remit domain dns <domain>          print the DNS records the domain needs
 #   remit domain check <domain>        compare published DNS with what Remit expects
 #   remit domain list
 #   remit domain remove <domain>
-#   remit sender add <login> <domain>[,<domain>...]   create SMTP credentials for a project
-#   remit sender passwd <login>        rotate a password
-#   remit sender list
-#   remit sender remove <login>
-#   remit route set <domain> <host>[:port] [<user>]   deliver a domain through a provider (Google, SES...)
-#   remit route remove <domain>        deliver the domain directly again
+#
+#   Routes (deliver a domain through a provider instead of directly)
+#   remit route set <domain> <host>[:port] [<user>] [--sign]
+#   remit route remove <domain>
 #   remit route list
-#   remit render                       rebuild Postfix/OpenDKIM tables from the state and reload
+#
+#   Operations
 #   remit test <from> <to>             send a signed test message
-#   remit status                       queue, domains, senders
+#   remit status                       queue, domains, projects
+#   remit render                       rebuild Postfix/OpenDKIM tables from the state and reload
 #   remit health                       exit 0 when Postfix and OpenDKIM are up
+#
+# Changing a project's domain is two commands: `remit project domain add` with
+# the new one, and once DNS is live and the app sends from it, `remit project
+# domain remove` with the old one. Host, user and password do not change.
 #
 # State lives in /var/lib/remit (a volume). Nothing here needs the image to be
 # rebuilt.
@@ -281,10 +295,17 @@ domain_check() {
 	else
 		note "SPF    WRONG   this relay is not in: $spf"; ok=1
 	fi
-	local dmarc
+	local dmarc parent="$d"
 	dmarc="$(dig +short TXT "_dmarc.${d}" 2>/dev/null | grep -i 'v=DMARC1' || true)"
-	if [ -n "$dmarc" ]; then
+	# Subdomains inherit the organizational domain's policy when they have none.
+	while [ -z "$dmarc" ] && [ "$(printf '%s' "$parent" | tr -cd . | wc -c)" -ge 2 ]; do
+		parent="${parent#*.}"
+		dmarc="$(dig +short TXT "_dmarc.${parent}" 2>/dev/null | grep -i 'v=DMARC1' || true)"
+	done
+	if [ -n "$dmarc" ] && [ "$parent" = "$d" ]; then
 		note "DMARC  ok      $dmarc"
+	elif [ -n "$dmarc" ]; then
+		note "DMARC  ok      inherited from _dmarc.${parent}: $dmarc"
 	else
 		note "DMARC  missing _dmarc.${d} (recommended, not required)"
 	fi
@@ -303,7 +324,7 @@ domain_list() {
 		owners="$(awk -v d="$d" '{ n=split($2,ds,","); for(i=1;i<=n;i++) if (ds[i]==d) printf "%s ", $1 }' "$SENDERS_FILE")"
 		local via
 		via="$(route_get "$d" relay)"
-		printf '%-40s senders: %-24s via: %s\n' "$d" "${owners:-none}" "${via:-direct}"
+		printf '%-40s projects: %-24s via: %s\n' "$d" "${owners:-none}" "${via:-direct}"
 	done < "$DOMAINS_FILE"
 }
 
@@ -313,7 +334,7 @@ domain_remove() {
 	d="${d,,}"
 	domain_exists "$d" || die "$d is not registered"
 	if awk '{print $2}' "$SENDERS_FILE" | tr ',' '\n' | grep -qx -- "$d"; then
-		die "$d is still assigned to a sender; remove or change that sender first"
+		die "$d is still used by a project; run: remit project domain remove <name> $d"
 	fi
 	grep -vx -- "$d" "$DOMAINS_FILE" > "$DOMAINS_FILE.tmp" || true
 	mv "$DOMAINS_FILE.tmp" "$DOMAINS_FILE"
@@ -324,7 +345,7 @@ domain_remove() {
 }
 
 # ----------------------------------------------------------------------------
-# sender
+# project
 # ----------------------------------------------------------------------------
 
 new_password() {
@@ -336,6 +357,13 @@ set_password() {
 	printf '%s' "$password" | saslpasswd2 -p -c -f "$SASLDB" -u "$(realm)" "$login"
 	chown postfix:postfix "$SASLDB"
 	chmod 600 "$SASLDB"
+}
+
+project_domains() { awk -v l="$1" '$1==l {print $2}' "$SENDERS_FILE"; }
+
+set_project_domains() { # login domains
+	awk -v l="$1" -v ds="$2" '$1==l { $2=ds } { print $1, $2 }' "$SENDERS_FILE" > "$SENDERS_FILE.tmp"
+	mv "$SENDERS_FILE.tmp" "$SENDERS_FILE"
 }
 
 print_credentials() {
@@ -354,16 +382,27 @@ print_credentials() {
 	EOF
 }
 
-sender_add() {
+# Register a domain if it is new (prints its DNS records); silent otherwise.
+ensure_domain() {
+	local d="$1"
+	if ! domain_exists "$d"; then
+		domain_add "$d"
+	fi
+}
+
+project_add() {
 	local login="${1:-}" domains="${2:-}"
-	[ -n "$login" ] && [ -n "$domains" ] || die "usage: remit sender add <login> <domain>[,<domain>...]"
+	[ -n "$login" ] && [ -n "$domains" ] || die "usage: remit project add <name> <domain>[,<domain>...]"
 	login="${login,,}"; domains="${domains,,}"
-	valid_login "$login" || die "'$login' is not a valid login (a-z, 0-9, . _ -)"
+	valid_login "$login" || die "'$login' is not a valid project name (a-z, 0-9, . _ -)"
 	init_state
-	login_exists "$login" && die "sender '$login' already exists (use: remit sender passwd $login)"
+	login_exists "$login" && die "project '$login' already exists (see: remit project show $login)"
 	local d
 	for d in ${domains//,/ }; do
-		domain_exists "$d" || die "domain '$d' is not registered; run: remit domain add $d"
+		valid_domain "$d" || die "'$d' is not a valid domain name"
+	done
+	for d in ${domains//,/ }; do
+		ensure_domain "$d"
 	done
 	local password
 	password="$(new_password)"
@@ -373,37 +412,96 @@ sender_add() {
 	print_credentials "$login" "$password" "$domains"
 }
 
-sender_passwd() {
-	local login="${1:-}"
-	[ -n "$login" ] || die "usage: remit sender passwd <login>"
-	login="${login,,}"
-	login_exists "$login" || die "sender '$login' does not exist"
-	local password domains
-	password="$(new_password)"
-	domains="$(awk -v l="$login" '$1==l {print $2}' "$SENDERS_FILE")"
-	set_password "$login" "$password"
-	print_credentials "$login" "$password" "$domains"
+project_domain_add() {
+	local login="${1:-}" d="${2:-}"
+	[ -n "$login" ] && [ -n "$d" ] || die "usage: remit project domain add <name> <domain>"
+	login="${login,,}"; d="${d,,}"
+	login_exists "$login" || die "project '$login' does not exist"
+	valid_domain "$d" || die "'$d' is not a valid domain name"
+	local current
+	current="$(project_domains "$login")"
+	if printf '%s' "$current" | tr ',' '\n' | grep -qx -- "$d"; then
+		note "$login already sends from $d"
+		print_dns "$d"
+		return
+	fi
+	ensure_domain "$d"
+	set_project_domains "$login" "${current:+$current,}$d"
+	render
+	cat <<-EOF
+		$login can now send from @$d (and still from @${current//,/, @}).
+
+		Next steps:
+		  1. publish the DNS records above, then: remit domain check $d
+		  2. change the application's From address to something@$d
+		     (host, user and password stay the same)
+		  3. when the old domain is no longer used: remit project domain remove $login <old domain>
+	EOF
 }
 
-sender_list() {
+project_domain_remove() {
+	local login="${1:-}" d="${2:-}"
+	[ -n "$login" ] && [ -n "$d" ] || die "usage: remit project domain remove <name> <domain>"
+	login="${login,,}"; d="${d,,}"
+	login_exists "$login" || die "project '$login' does not exist"
+	local current remaining
+	current="$(project_domains "$login")"
+	printf '%s' "$current" | tr ',' '\n' | grep -qx -- "$d" || die "$login does not send from $d"
+	remaining="$(printf '%s' "$current" | tr ',' '\n' | grep -vx -- "$d" | paste -sd, -)"
+	[ -n "$remaining" ] || die "$d is the only domain of $login; add the new one first (remit project domain add $login <domain>)"
+	set_project_domains "$login" "$remaining"
+	render
+	note "$login no longer sends from $d (now: @${remaining//,/, @})"
+	if ! awk '{print $2}' "$SENDERS_FILE" | tr ',' '\n' | grep -qx -- "$d"; then
+		note "no project uses $d any more; drop it with: remit domain remove $d"
+	fi
+}
+
+project_show() {
+	local login="${1:-}"
+	[ -n "$login" ] || die "usage: remit project show <name>"
+	login="${login,,}"
+	login_exists "$login" || die "project '$login' does not exist"
+	local d via
+	printf 'project   %s\n' "$login"
+	printf 'login     %s  (port 587)\n' "$login"
+	for d in $(project_domains "$login" | tr ',' ' '); do
+		via="$(route_get "$d" relay)"
+		printf '\ndomain    %s   via %s\n' "$d" "${via:-direct}"
+		domain_check "$d" | sed 's/^/          /' || true
+	done
+}
+
+project_passwd() {
+	local login="${1:-}"
+	[ -n "$login" ] || die "usage: remit project passwd <name>"
+	login="${login,,}"
+	login_exists "$login" || die "project '$login' does not exist"
+	local password
+	password="$(new_password)"
+	set_password "$login" "$password"
+	print_credentials "$login" "$password" "$(project_domains "$login")"
+}
+
+project_list() {
 	init_state
 	if [ ! -s "$SENDERS_FILE" ]; then
-		note "no senders; run: remit sender add <login> <domain>"
+		note "no projects; run: remit project add <name> <domain>"
 		return
 	fi
 	awk '{ printf "%-24s %s\n", $1, $2 }' "$SENDERS_FILE"
 }
 
-sender_remove() {
+project_remove() {
 	local login="${1:-}"
-	[ -n "$login" ] || die "usage: remit sender remove <login>"
+	[ -n "$login" ] || die "usage: remit project remove <name>"
 	login="${login,,}"
-	login_exists "$login" || die "sender '$login' does not exist"
+	login_exists "$login" || die "project '$login' does not exist"
 	saslpasswd2 -d -f "$SASLDB" -u "$(realm)" "$login" || true
 	awk -v l="$login" '$1!=l' "$SENDERS_FILE" > "$SENDERS_FILE.tmp"
 	mv "$SENDERS_FILE.tmp" "$SENDERS_FILE"
 	render
-	note "removed sender '$login'"
+	note "removed project '$login' (its domains stay registered)"
 }
 
 # ----------------------------------------------------------------------------
@@ -510,7 +608,7 @@ status() {
 	printf 'postfix    %s\n' "$(postfix status >/dev/null 2>&1 && echo running || echo stopped)"
 	printf 'opendkim   %s\n' "$(pidof opendkim >/dev/null 2>&1 && echo running || echo stopped)"
 	printf 'domains    %s\n' "$(grep -c . "$DOMAINS_FILE" || true)"
-	printf 'senders    %s\n' "$(grep -c . "$SENDERS_FILE" || true)"
+	printf 'projects   %s\n' "$(grep -c . "$SENDERS_FILE" || true)"
 	printf 'queue      %s\n' "$(postqueue -p 2>/dev/null | tail -n 1 | sed 's/^-- //; s/^Mail queue is empty/empty/')"
 }
 
@@ -522,7 +620,9 @@ health() {
 }
 
 usage() {
-	sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | sed '1d'
+	# The comment block at the top of this file, up to the first blank line
+	# after the command list.
+	awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
 }
 
 # ----------------------------------------------------------------------------
@@ -537,12 +637,19 @@ case "${1:-}" in
 			remove) domain_remove "${3:-}" ;;
 			*)      usage; exit 1 ;;
 		esac ;;
-	sender)
+	project|sender)
 		case "${2:-}" in
-			add)    sender_add "${3:-}" "${4:-}" ;;
-			passwd) sender_passwd "${3:-}" ;;
-			list)   sender_list ;;
-			remove) sender_remove "${3:-}" ;;
+			add)    project_add "${3:-}" "${4:-}" ;;
+			domain)
+				case "${3:-}" in
+					add)    project_domain_add "${4:-}" "${5:-}" ;;
+					remove) project_domain_remove "${4:-}" "${5:-}" ;;
+					*)      usage; exit 1 ;;
+				esac ;;
+			show)   project_show "${3:-}" ;;
+			passwd) project_passwd "${3:-}" ;;
+			list)   project_list ;;
+			remove) project_remove "${3:-}" ;;
 			*)      usage; exit 1 ;;
 		esac ;;
 	route)

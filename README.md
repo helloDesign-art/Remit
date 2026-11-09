@@ -26,12 +26,13 @@ one server.
 
 - **Send-only Postfix** tuned for transactional mail. Nothing listens on port
   25; there is no inbound mail, no mailboxes, no open relay.
-- **DKIM for every domain** you register, with a one-command setup that prints
-  the exact DNS records to add (DKIM, SPF, DMARC) and a checker that tells you
+- **DKIM for every domain**, generated when the domain is added, with the exact
+  DNS records to publish (DKIM, SPF, DMARC) and a checker that tells you
   whether they are live.
-- **One login per project.** Credentials are created with the CLI and each
-  login can only send from the domains assigned to it. A project cannot
-  impersonate another, even on the same server.
+- **Projects, not just logins.** Each application gets credentials and a list
+  of domains it may send from; it cannot impersonate another project, even on
+  the same server. Changing a project's domain is one command: Remit creates
+  the key, prints the DNS, and the application only changes its From address.
 - **Private by default.** The relay binds to Docker's `host-gateway` address,
   which every container on the host can reach and the internet cannot. Your
   applications connect to host `remit`, port 587, with their login.
@@ -56,14 +57,21 @@ cd Remit
 cp .env.example .env         # set REMIT_HOSTNAME and REMIT_PUBLIC_IP
 docker compose up -d --build
 
-# Register a sending domain. This creates its DKIM key and prints the DNS records.
-docker compose exec relay remit domain add example.com
-
-# Create credentials for an application and allow it to send as @example.com.
-docker compose exec relay remit sender add myapp example.com
+# Create a project: SMTP credentials for an application plus the domain it
+# sends from. The domain's DKIM key is generated and the DNS records printed.
+docker compose exec relay remit project add myapp example.com
 
 # Once DNS has propagated:
-docker compose exec relay remit domain check example.com
+docker compose exec relay remit project show myapp
+```
+
+Moving an application to a new domain is one command and a change of the
+From address in the application; host, user and password stay the same:
+
+```bash
+docker compose exec relay remit project domain add myapp new-example.com
+# publish the DNS it prints, switch the app's From to @new-example.com, then
+docker compose exec relay remit project domain remove myapp example.com
 ```
 
 Then, in the application's Compose file:
@@ -77,7 +85,7 @@ services:
       SMTP_HOST: remit
       SMTP_PORT: 587
       SMTP_USER: myapp
-      SMTP_PASSWORD: <printed by `remit sender add`>
+      SMTP_PASSWORD: <printed by `remit project add`>
 ```
 
 Any SMTP library works (Nodemailer, smtplib, PHPMailer, JavaMail...). Use
@@ -87,16 +95,19 @@ plain SMTP with AUTH (`secure: false`, no STARTTLS) unless you enabled
 ## CLI
 
 ```
-remit domain add <domain>         register a domain, create its DKIM key, print DNS records
-remit domain dns <domain>         print the DNS records again
+remit project add <name> <domain>[,<domain>...]   credentials + domains + DNS records
+remit project domain add <name> <domain>          send from one more domain (new or existing)
+remit project domain remove <name> <domain>       stop sending from a domain
+remit project show <name>                         domains, routes, live DNS status
+remit project passwd <name>                       rotate the SMTP password
+remit project list
+remit project remove <name>
+
+remit domain add <domain>         register a domain without assigning it
+remit domain dns <domain>         print its DNS records again
 remit domain check <domain>       verify DKIM / SPF / DMARC as published
 remit domain list
 remit domain remove <domain>
-
-remit sender add <login> <domain>[,<domain>...]   create SMTP credentials
-remit sender passwd <login>       rotate a password
-remit sender list
-remit sender remove <login>
 
 remit route set <domain> <host>[:port] [<user>] [--sign]   deliver a domain through a provider
 remit route remove <domain>       deliver it directly again

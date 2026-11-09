@@ -1,0 +1,49 @@
+# Remit — self-hosted transactional email relay
+#
+#   cp .env.example .env   # set REMIT_HOSTNAME at least
+#   docker compose up -d --build
+#   docker compose exec relay remit domain add example.com
+#   docker compose exec relay remit sender add myapp example.com
+#
+# The relay listens on REMIT_BIND_ADDR:REMIT_PORT. The default binds to the
+# Docker host-gateway address (172.17.0.1), which other containers on the same
+# host can reach as "host-gateway" and which is not reachable from the
+# internet. Bind to 0.0.0.0 only if you also turn on REMIT_SUBMISSION_TLS and
+# firewall the port.
+
+name: remit
+
+services:
+  relay:
+    build: ./relay
+    image: remit/relay:latest
+    restart: unless-stopped
+    environment:
+      REMIT_HOSTNAME: ${REMIT_HOSTNAME:?set REMIT_HOSTNAME in .env (FQDN that resolves to this server)}
+      REMIT_PUBLIC_IP: ${REMIT_PUBLIC_IP:-}
+      REMIT_DKIM_SELECTOR: ${REMIT_DKIM_SELECTOR:-remit}
+      REMIT_SUBMISSION_TLS: ${REMIT_SUBMISSION_TLS:-none}
+      REMIT_MESSAGE_SIZE_MB: ${REMIT_MESSAGE_SIZE_MB:-25}
+      REMIT_CLIENT_RATE_LIMIT: ${REMIT_CLIENT_RATE_LIMIT:-300}
+      REMIT_RELAYHOST: ${REMIT_RELAYHOST:-}
+      REMIT_RELAY_USER: ${REMIT_RELAY_USER:-}
+      REMIT_RELAY_PASSWORD: ${REMIT_RELAY_PASSWORD:-}
+    ports:
+      - "${REMIT_BIND_ADDR:-172.17.0.1}:${REMIT_PORT:-587}:587"
+    volumes:
+      - state:/var/lib/remit
+      - spool:/var/spool/postfix
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  state:
+  spool:

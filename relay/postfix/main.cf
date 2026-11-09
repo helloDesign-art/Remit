@@ -1,0 +1,106 @@
+# Remit relay — Postfix configuration
+#
+# Values that depend on the deployment (hostname, limits, relayhost) are set
+# by the entrypoint with `postconf -e` from environment variables, so they do
+# not appear here. Everything below is policy and does not change per install.
+
+compatibility_level = 3.6
+maillog_file = /dev/stdout
+
+# --- Identity ---------------------------------------------------------------
+# myhostname is set from REMIT_HOSTNAME at start.
+myorigin = $myhostname
+smtp_helo_name = $myhostname
+
+# --- Networking -------------------------------------------------------------
+# IPv4 only: most hosts have no IPv6 reverse DNS, and Gmail rejects mail from
+# IPv6 addresses without one.
+inet_interfaces = all
+inet_protocols = ipv4
+
+# --- Send-only --------------------------------------------------------------
+# This machine delivers nothing locally and accepts nothing for itself.
+mydestination =
+local_recipient_maps =
+local_transport = error:local delivery is disabled on this relay
+alias_maps =
+alias_database =
+relay_domains =
+
+# Only loopback counts as "us"; project containers must authenticate.
+mynetworks = 127.0.0.0/8
+
+# --- Authentication (Cyrus SASL, sasldb) ------------------------------------
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_type = cyrus
+smtpd_sasl_path = smtpd
+cyrus_sasl_config_path = /etc/sasl2
+smtpd_sasl_security_options = noanonymous
+smtpd_sasl_local_domain = $myhostname
+smtpd_sasl_authenticated_header = no
+broken_sasl_auth_clients = no
+
+# Each login owns a set of sender domains (@domain  login).
+smtpd_sender_login_maps = texthash:/var/lib/remit/postfix/sender_login
+
+# --- Access policy ----------------------------------------------------------
+smtpd_helo_required = yes
+disable_vrfy_command = yes
+smtpd_delay_reject = yes
+strict_rfc821_envelopes = yes
+
+smtpd_client_restrictions =
+    permit_sasl_authenticated,
+    reject
+
+smtpd_sender_restrictions =
+    reject_non_fqdn_sender,
+    reject_sender_login_mismatch
+
+smtpd_relay_restrictions =
+    permit_sasl_authenticated,
+    reject
+
+smtpd_recipient_restrictions =
+    reject_non_fqdn_recipient,
+    reject_unknown_recipient_domain,
+    permit_sasl_authenticated,
+    reject
+
+# --- Abuse limits (per client IP, per anvil_rate_time_unit) -----------------
+# Defaults are tuned for transactional mail; override with REMIT_* variables.
+anvil_rate_time_unit = 60s
+smtpd_client_connection_count_limit = 20
+smtpd_client_connection_rate_limit = 120
+smtpd_client_event_limit_exceptions = 127.0.0.0/8
+smtpd_recipient_limit = 50
+smtpd_hard_error_limit = 10
+
+# --- Outbound delivery ------------------------------------------------------
+smtp_tls_security_level = may
+smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt
+smtp_tls_loglevel = 1
+smtp_tls_protocols = >=TLSv1.2
+smtp_tls_note_starttls_offer = yes
+smtp_dns_support_level = enabled
+default_destination_concurrency_limit = 5
+smtp_destination_concurrency_limit = 5
+smtp_connect_timeout = 30s
+maximal_queue_lifetime = 1d
+bounce_queue_lifetime = 1d
+delay_warning_time = 4h
+
+# TLS towards clients is configured by the entrypoint (REMIT_SUBMISSION_TLS).
+smtpd_tls_security_level = none
+
+# --- Privacy ----------------------------------------------------------------
+# Drop the Received: line that would leak the internal address of the project
+# that submitted the message.
+header_checks = regexp:/etc/postfix/header_checks
+
+# --- DKIM (OpenDKIM milter, same container) ---------------------------------
+milter_protocol = 6
+milter_default_action = tempfail
+milter_mail_macros = i {auth_type} {auth_authen} {mail_addr} {client_addr} {client_name}
+smtpd_milters = inet:127.0.0.1:8891
+non_smtpd_milters = $smtpd_milters

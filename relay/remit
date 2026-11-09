@@ -1,0 +1,430 @@
+#!/bin/bash
+# remit — operate the Remit relay from inside the container.
+#
+#   remit domain add <domain>          register a sending domain (creates its DKIM key)
+#   remit domain dns <domain>          print the DNS records the domain needs
+#   remit domain check <domain>        compare published DNS with what Remit expects
+#   remit domain list
+#   remit domain remove <domain>
+#   remit sender add <login> <domain>[,<domain>...]   create SMTP credentials for a project
+#   remit sender passwd <login>        rotate a password
+#   remit sender list
+#   remit sender remove <login>
+#   remit render                       rebuild Postfix/OpenDKIM tables from the state and reload
+#   remit test <from> <to>             send a signed test message
+#   remit status                       queue, domains, senders
+#   remit health                       exit 0 when Postfix and OpenDKIM are up
+#
+# State lives in /var/lib/remit (a volume). Nothing here needs the image to be
+# rebuilt.
+
+set -euo pipefail
+
+STATE=/var/lib/remit
+DOMAINS_FILE="$STATE/domains"
+SENDERS_FILE="$STATE/senders"
+REALM_FILE="$STATE/realm"
+SASLDB="$STATE/sasldb2"
+KEYS_DIR="$STATE/keys"
+SELECTOR="${REMIT_DKIM_SELECTOR:-remit}"
+
+die()  { printf 'remit: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+
+# ----------------------------------------------------------------------------
+# State helpers
+# ----------------------------------------------------------------------------
+
+init_state() {
+	mkdir -p "$KEYS_DIR" "$STATE/postfix" "$STATE/opendkim"
+	touch "$DOMAINS_FILE" "$SENDERS_FILE"
+	if [ ! -s "$REALM_FILE" ]; then
+		[ -n "${REMIT_HOSTNAME:-}" ] || die "REMIT_HOSTNAME is not set"
+		printf '%s\n' "$REMIT_HOSTNAME" > "$REALM_FILE"
+	fi
+	chmod 700 "$KEYS_DIR"
+}
+
+realm() { cat "$REALM_FILE"; }
+
+valid_domain() {
+	[[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
+}
+
+valid_login() {
+	[[ "$1" =~ ^[a-z0-9][a-z0-9._-]{1,62}$ ]]
+}
+
+domain_exists() { grep -qx -- "$1" "$DOMAINS_FILE"; }
+login_exists()  { awk '{print $1}' "$SENDERS_FILE" | grep -qx -- "$1"; }
+
+dkim_public_value() {
+	# The .txt written by opendkim-genkey is BIND syntax split in quoted
+	# chunks; join them into the single string that goes in the TXT record.
+	local f="$KEYS_DIR/$1/$SELECTOR.txt"
+	[ -f "$f" ] || die "no DKIM key for $1"
+	grep -o '"[^"]*"' "$f" | tr -d '"\n' | sed 's/[[:space:]]\+/ /g; s/^ //'
+}
+
+# ----------------------------------------------------------------------------
+# render: state -> Postfix and OpenDKIM tables
+# ----------------------------------------------------------------------------
+
+render() {
+	local reload="${1:-reload}"
+	init_state
+
+	# Hosts whose mail OpenDKIM signs: the container itself and the private
+	# ranges where project containers live. Authenticated clients are also
+	# covered by MacroList in opendkim.conf.
+	cat > "$STATE/opendkim/TrustedHosts" <<-EOF
+		127.0.0.1
+		::1
+		10.0.0.0/8
+		172.16.0.0/12
+		192.168.0.0/16
+	EOF
+
+	# (Bash scopes are dynamic: keep this loop variable local so it cannot
+	# clobber a caller's "d".)
+	local dom
+	: > "$STATE/opendkim/KeyTable.tmp"
+	: > "$STATE/opendkim/SigningTable.tmp"
+	while read -r dom; do
+		[ -n "$dom" ] || continue
+		printf '%s._domainkey.%s %s:%s:%s/%s/%s.private\n' \
+			"$SELECTOR" "$dom" "$dom" "$SELECTOR" "$KEYS_DIR" "$dom" "$SELECTOR" >> "$STATE/opendkim/KeyTable.tmp"
+		# refile: keys are glob-style patterns where "*" matches anything.
+		printf '*@%s %s._domainkey.%s\n' \
+			"$dom" "$SELECTOR" "$dom" >> "$STATE/opendkim/SigningTable.tmp"
+	done < "$DOMAINS_FILE"
+	mv "$STATE/opendkim/KeyTable.tmp" "$STATE/opendkim/KeyTable"
+	mv "$STATE/opendkim/SigningTable.tmp" "$STATE/opendkim/SigningTable"
+
+	# Postfix sender_login_maps: "@domain login1@realm,login2@realm".
+	# Postfix reports SASL logins as login@realm (smtpd_sasl_local_domain), so
+	# the owners must carry the realm too.
+	: > "$STATE/postfix/sender_login.tmp"
+	awk -v realm="$(realm)" '
+		NF >= 2 {
+			n = split($2, ds, ",")
+			for (i = 1; i <= n; i++) {
+				who = $1 "@" realm
+				# (assign through a temporary: referencing owners[x] on the
+				# left creates the entry before the right side is evaluated)
+				v = (ds[i] in owners) ? owners[ds[i]] "," who : who
+				owners[ds[i]] = v
+			}
+		}
+		END { for (d in owners) printf "@%s %s\n", d, owners[d] }
+	' "$SENDERS_FILE" | sort > "$STATE/postfix/sender_login.tmp"
+	mv "$STATE/postfix/sender_login.tmp" "$STATE/postfix/sender_login"
+
+	# Permissions: keys for opendkim only, sasldb for postfix only, tables readable.
+	chown -R opendkim:opendkim "$KEYS_DIR" 2>/dev/null || true
+	find "$KEYS_DIR" -type f -name '*.private' -exec chmod 600 {} +
+	[ -f "$SASLDB" ] && { chown postfix:postfix "$SASLDB"; chmod 600 "$SASLDB"; }
+	chmod 644 "$STATE/opendkim"/* "$STATE/postfix"/*
+	chmod 600 "$STATE/postfix/relay_password" 2>/dev/null || true
+
+	if [ "$reload" = reload ]; then
+		if postfix status >/dev/null 2>&1; then
+			postfix reload >/dev/null 2>&1 || true
+		fi
+		# The supervisor in the entrypoint restarts OpenDKIM so it picks up
+		# the new tables.
+		if pidof opendkim >/dev/null 2>&1; then
+			kill "$(pidof opendkim)" 2>/dev/null || true
+		fi
+	fi
+}
+
+# ----------------------------------------------------------------------------
+# domain
+# ----------------------------------------------------------------------------
+
+print_dns() {
+	local d="$1"
+	local spf_source
+	if [ -n "${REMIT_PUBLIC_IP:-}" ]; then
+		spf_source="ip4:${REMIT_PUBLIC_IP}"
+	else
+		spf_source="a:$(realm)"
+	fi
+	cat <<-EOF
+
+		DNS records for $d  (TXT records are never proxied; add them as-is)
+
+		  DKIM   TXT  ${SELECTOR}._domainkey.${d}
+		         $(dkim_public_value "$d")
+
+		  SPF    TXT  ${d}
+		         v=spf1 ${spf_source} ~all
+		         (if the domain already has an SPF record, add "${spf_source}"
+		          to it instead; a domain must have exactly one SPF record)
+
+		  DMARC  TXT  _dmarc.${d}
+		         v=DMARC1; p=none; rua=mailto:dmarc@${d}
+		         (start with p=none, move to quarantine once reports look clean)
+
+	EOF
+}
+
+domain_add() {
+	local d="${1:-}"
+	[ -n "$d" ] || die "usage: remit domain add <domain>"
+	d="${d,,}"
+	valid_domain "$d" || die "'$d' is not a valid domain name"
+	init_state
+	if domain_exists "$d"; then
+		note "$d is already registered"
+	else
+		mkdir -p "$KEYS_DIR/$d"
+		if [ ! -f "$KEYS_DIR/$d/$SELECTOR.private" ]; then
+			opendkim-genkey -b 2048 -r -s "$SELECTOR" -d "$d" -D "$KEYS_DIR/$d/"
+		fi
+		printf '%s\n' "$d" >> "$DOMAINS_FILE"
+		render
+		note "registered $d (DKIM selector: $SELECTOR)"
+	fi
+	print_dns "$d"
+}
+
+domain_dns() {
+	local d="${1:-}"
+	[ -n "$d" ] || die "usage: remit domain dns <domain>"
+	d="${d,,}"
+	domain_exists "$d" || die "$d is not registered"
+	print_dns "$d"
+}
+
+domain_check() {
+	local d="${1:-}"
+	[ -n "$d" ] || die "usage: remit domain check <domain>"
+	d="${d,,}"
+	domain_exists "$d" || die "$d is not registered"
+	local ok=0
+	local expected published
+	expected="$(dkim_public_value "$d" | grep -o 'p=[A-Za-z0-9+/=]*')"
+	published="$(dig +short TXT "${SELECTOR}._domainkey.${d}" 2>/dev/null | tr -d '" \n' | grep -o 'p=[A-Za-z0-9+/=]*' || true)"
+	if [ -n "$published" ] && [ "$published" = "$expected" ]; then
+		note "DKIM   ok      ${SELECTOR}._domainkey.${d} matches the local key"
+	elif [ -n "$published" ]; then
+		note "DKIM   WRONG   ${SELECTOR}._domainkey.${d} is published but does not match"; ok=1
+	else
+		note "DKIM   missing ${SELECTOR}._domainkey.${d}"; ok=1
+	fi
+	local spf_count spf
+	spf="$(dig +short TXT "$d" 2>/dev/null | grep -i 'v=spf1' || true)"
+	spf_count="$(printf '%s' "$spf" | grep -c . || true)"
+	if [ "$spf_count" -eq 0 ]; then
+		note "SPF    missing no v=spf1 record on $d"; ok=1
+	elif [ "$spf_count" -gt 1 ]; then
+		note "SPF    INVALID $d has $spf_count SPF records; it must have exactly one"; ok=1
+	elif { [ -n "${REMIT_PUBLIC_IP:-}" ] && printf '%s' "$spf" | grep -q "ip4:${REMIT_PUBLIC_IP}"; } \
+	   || printf '%s' "$spf" | grep -q "a:$(realm)"; then
+		note "SPF    ok      $spf"
+	else
+		note "SPF    WRONG   this relay is not in: $spf"; ok=1
+	fi
+	local dmarc
+	dmarc="$(dig +short TXT "_dmarc.${d}" 2>/dev/null | grep -i 'v=DMARC1' || true)"
+	if [ -n "$dmarc" ]; then
+		note "DMARC  ok      $dmarc"
+	else
+		note "DMARC  missing _dmarc.${d} (recommended, not required)"
+	fi
+	return $ok
+}
+
+domain_list() {
+	init_state
+	if [ ! -s "$DOMAINS_FILE" ]; then
+		note "no domains registered; run: remit domain add <domain>"
+		return
+	fi
+	while read -r d; do
+		[ -n "$d" ] || continue
+		local owners
+		owners="$(awk -v d="$d" '{ n=split($2,ds,","); for(i=1;i<=n;i++) if (ds[i]==d) printf "%s ", $1 }' "$SENDERS_FILE")"
+		printf '%-40s senders: %s\n' "$d" "${owners:-none}"
+	done < "$DOMAINS_FILE"
+}
+
+domain_remove() {
+	local d="${1:-}"
+	[ -n "$d" ] || die "usage: remit domain remove <domain>"
+	d="${d,,}"
+	domain_exists "$d" || die "$d is not registered"
+	if awk '{print $2}' "$SENDERS_FILE" | tr ',' '\n' | grep -qx -- "$d"; then
+		die "$d is still assigned to a sender; remove or change that sender first"
+	fi
+	grep -vx -- "$d" "$DOMAINS_FILE" > "$DOMAINS_FILE.tmp" || true
+	mv "$DOMAINS_FILE.tmp" "$DOMAINS_FILE"
+	# Keep the key on disk: DNS may still reference it. Deleting it is a
+	# deliberate manual step.
+	render
+	note "removed $d (its DKIM key stays in $KEYS_DIR/$d until you delete it)"
+}
+
+# ----------------------------------------------------------------------------
+# sender
+# ----------------------------------------------------------------------------
+
+new_password() {
+	openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32
+}
+
+set_password() {
+	local login="$1" password="$2"
+	printf '%s' "$password" | saslpasswd2 -p -c -f "$SASLDB" -u "$(realm)" "$login"
+	chown postfix:postfix "$SASLDB"
+	chmod 600 "$SASLDB"
+}
+
+print_credentials() {
+	local login="$1" password="$2" domains="$3"
+	cat <<-EOF
+
+		SMTP credentials for '$login'  (shown once; Remit does not store the clear text)
+
+		  host      the address Remit is published on (e.g. "remit" via host-gateway)
+		  port      587
+		  tls       $( [ "${REMIT_SUBMISSION_TLS:-none}" = "may" ] && echo "STARTTLS available (self-signed)" || echo "none (traffic stays inside the host)" )
+		  user      $login
+		  password  $password
+		  from      any address @ ${domains//,/, @}
+
+	EOF
+}
+
+sender_add() {
+	local login="${1:-}" domains="${2:-}"
+	[ -n "$login" ] && [ -n "$domains" ] || die "usage: remit sender add <login> <domain>[,<domain>...]"
+	login="${login,,}"; domains="${domains,,}"
+	valid_login "$login" || die "'$login' is not a valid login (a-z, 0-9, . _ -)"
+	init_state
+	login_exists "$login" && die "sender '$login' already exists (use: remit sender passwd $login)"
+	local d
+	for d in ${domains//,/ }; do
+		domain_exists "$d" || die "domain '$d' is not registered; run: remit domain add $d"
+	done
+	local password
+	password="$(new_password)"
+	set_password "$login" "$password"
+	printf '%s %s\n' "$login" "$domains" >> "$SENDERS_FILE"
+	render
+	print_credentials "$login" "$password" "$domains"
+}
+
+sender_passwd() {
+	local login="${1:-}"
+	[ -n "$login" ] || die "usage: remit sender passwd <login>"
+	login="${login,,}"
+	login_exists "$login" || die "sender '$login' does not exist"
+	local password domains
+	password="$(new_password)"
+	domains="$(awk -v l="$login" '$1==l {print $2}' "$SENDERS_FILE")"
+	set_password "$login" "$password"
+	print_credentials "$login" "$password" "$domains"
+}
+
+sender_list() {
+	init_state
+	if [ ! -s "$SENDERS_FILE" ]; then
+		note "no senders; run: remit sender add <login> <domain>"
+		return
+	fi
+	awk '{ printf "%-24s %s\n", $1, $2 }' "$SENDERS_FILE"
+}
+
+sender_remove() {
+	local login="${1:-}"
+	[ -n "$login" ] || die "usage: remit sender remove <login>"
+	login="${login,,}"
+	login_exists "$login" || die "sender '$login' does not exist"
+	saslpasswd2 -d -f "$SASLDB" -u "$(realm)" "$login" || true
+	awk -v l="$login" '$1!=l' "$SENDERS_FILE" > "$SENDERS_FILE.tmp"
+	mv "$SENDERS_FILE.tmp" "$SENDERS_FILE"
+	render
+	note "removed sender '$login'"
+}
+
+# ----------------------------------------------------------------------------
+# test / status / health
+# ----------------------------------------------------------------------------
+
+send_test() {
+	local from="${1:-}" to="${2:-}"
+	[ -n "$from" ] && [ -n "$to" ] || die "usage: remit test <from> <to>"
+	local d="${from##*@}"
+	domain_exists "${d,,}" || note "warning: ${d} is not a registered domain; the message will go out unsigned"
+	local id
+	id="$(openssl rand -hex 12)"
+	sendmail -f "$from" "$to" <<-EOF
+		From: Remit <$from>
+		To: <$to>
+		Subject: Remit test message
+		Date: $(date -R)
+		Message-ID: <${id}@$(realm)>
+		MIME-Version: 1.0
+		Content-Type: text/plain; charset=utf-8
+
+		This message was sent through a Remit relay to check delivery and signing.
+
+		Relay:    $(realm)
+		Domain:   $d
+		Selector: $SELECTOR
+		Time:     $(date -u +%Y-%m-%dT%H:%M:%SZ)
+	EOF
+	note "queued test message $id from $from to $to; follow it with: remit status"
+}
+
+status() {
+	init_state
+	printf 'hostname   %s\n' "$(postconf -h myhostname 2>/dev/null || realm)"
+	printf 'postfix    %s\n' "$(postfix status >/dev/null 2>&1 && echo running || echo stopped)"
+	printf 'opendkim   %s\n' "$(pidof opendkim >/dev/null 2>&1 && echo running || echo stopped)"
+	printf 'domains    %s\n' "$(grep -c . "$DOMAINS_FILE" || true)"
+	printf 'senders    %s\n' "$(grep -c . "$SENDERS_FILE" || true)"
+	printf 'queue      %s\n' "$(postqueue -p 2>/dev/null | tail -n 1 | sed 's/^-- //; s/^Mail queue is empty/empty/')"
+}
+
+health() {
+	postfix status >/dev/null 2>&1 || exit 1
+	pidof opendkim >/dev/null 2>&1 || exit 1
+	nc -z 127.0.0.1 587 >/dev/null 2>&1 || exit 1
+	exit 0
+}
+
+usage() {
+	sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | sed '1d'
+}
+
+# ----------------------------------------------------------------------------
+
+case "${1:-}" in
+	domain)
+		case "${2:-}" in
+			add)    domain_add "${3:-}" ;;
+			dns)    domain_dns "${3:-}" ;;
+			check)  domain_check "${3:-}" ;;
+			list)   domain_list ;;
+			remove) domain_remove "${3:-}" ;;
+			*)      usage; exit 1 ;;
+		esac ;;
+	sender)
+		case "${2:-}" in
+			add)    sender_add "${3:-}" "${4:-}" ;;
+			passwd) sender_passwd "${3:-}" ;;
+			list)   sender_list ;;
+			remove) sender_remove "${3:-}" ;;
+			*)      usage; exit 1 ;;
+		esac ;;
+	render)  render "${2:-reload}" ;;
+	test)    send_test "${2:-}" "${3:-}" ;;
+	status)  status ;;
+	health)  health ;;
+	-h|--help|help|"") usage ;;
+	*) usage; exit 1 ;;
+esac

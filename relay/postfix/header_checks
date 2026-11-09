@@ -1,0 +1,4 @@
+# Remove the Received: header Postfix adds for authenticated submissions.
+# It would expose the private address of the service that sent the message
+# and adds nothing for the recipient. (ESMTPA = authenticated, ESMTPSA = +TLS)
+/^Received:.*\bwith E?SMTPS?A\b/   IGNORE

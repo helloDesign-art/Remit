@@ -23,6 +23,7 @@
 #   remit route list
 #
 #   Operations
+#   remit doctor                       check the server: hostname, reverse DNS, port 25, blocklists
 #   remit test <from> <to>             send a signed test message
 #   remit status                       queue, domains, projects
 #   remit render                       rebuild Postfix/OpenDKIM tables from the state and reload
@@ -620,6 +621,73 @@ send_test() {
 	note "queued test message $id from $from to $to; follow it with: remit status"
 }
 
+doctor() {
+	# Server-level checks that decide whether mail from this host is accepted
+	# at all. Each line is "ok", "warn" or "FAIL"; exit code 1 if any FAIL.
+	local host ip ok=0
+	host="$(realm)"
+	ip="${REMIT_PUBLIC_IP:-}"
+	if [ -z "$ip" ]; then
+		ip="$(dig +short A "$host" 2>/dev/null | head -1)"
+		[ -n "$ip" ] && note "info   REMIT_PUBLIC_IP is not set; using the address of $host ($ip)"
+	fi
+	[ -n "$ip" ] || { note "FAIL   cannot determine the public IP: set REMIT_PUBLIC_IP or publish an A record for $host"; return 1; }
+
+	# 1. hostname -> IP
+	local a
+	a="$(dig +short A "$host" 2>/dev/null | tr '\n' ' ')"
+	if printf '%s' "$a" | grep -qw -- "$ip"; then
+		note "ok     $host resolves to $ip"
+	elif [ -n "$a" ]; then
+		note "FAIL   $host resolves to ${a}but this server is $ip (is the record proxied through a CDN?)"; ok=1
+	else
+		note "FAIL   $host has no A record; add one pointing to $ip (not proxied)"; ok=1
+	fi
+
+	# 2. reverse DNS
+	local ptr ptr_ip
+	ptr="$(dig +short -x "$ip" 2>/dev/null | head -1 | sed 's/\.$//')"
+	if [ -z "$ptr" ]; then
+		note "FAIL   $ip has no reverse DNS (PTR); set it in your provider's panel, ideally to $host"; ok=1
+	else
+		ptr_ip="$(dig +short A "$ptr" 2>/dev/null | head -1)"
+		if [ "$ptr_ip" = "$ip" ] && [ "$ptr" = "$host" ]; then
+			note "ok     reverse DNS of $ip is $host and resolves back"
+		elif [ "$ptr_ip" = "$ip" ]; then
+			note "warn   reverse DNS of $ip is $ptr (resolves back, but differs from $host; minor)"
+		else
+			note "FAIL   reverse DNS of $ip is $ptr, which does not resolve back to $ip"; ok=1
+		fi
+	fi
+
+	# 3. outbound port 25 (skipped when everything goes through a relayhost)
+	if [ -n "${REMIT_RELAYHOST:-}" ]; then
+		note "info   outbound port 25 not needed: everything goes through ${REMIT_RELAYHOST}"
+	elif nc -z -w 5 gmail-smtp-in.l.google.com 25 >/dev/null 2>&1; then
+		note "ok     outbound port 25 is open"
+	else
+		note "FAIL   outbound port 25 is blocked; ask your provider to open it or set REMIT_RELAYHOST"; ok=1
+	fi
+
+	# 4. blocklists
+	local rev bl hit
+	rev="$(printf '%s' "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')"
+	for bl in zen.spamhaus.org bl.spamcop.net b.barracudacentral.org; do
+		hit="$(dig +short A "$rev.$bl" 2>/dev/null | head -1)"
+		case "$hit" in
+			"")        note "ok     $ip is not listed on $bl" ;;
+			127.255.*) note "warn   $bl refused the query (public resolver); check manually" ;;
+			*)         note "FAIL   $ip is listed on $bl ($hit); request delisting before sending"; ok=1 ;;
+		esac
+	done
+
+	# 5. services
+	postfix status >/dev/null 2>&1 && note "ok     postfix running" || { note "FAIL   postfix is not running"; ok=1; }
+	pidof opendkim >/dev/null 2>&1 && note "ok     opendkim running" || { note "FAIL   opendkim is not running"; ok=1; }
+
+	return $ok
+}
+
 status() {
 	init_state
 	printf 'hostname   %s\n' "$(postconf -h myhostname 2>/dev/null || realm)"
@@ -677,6 +745,7 @@ case "${1:-}" in
 			list)   route_list ;;
 			*)      usage; exit 1 ;;
 		esac ;;
+	doctor)  doctor ;;
 	render)  render "${2:-reload}" ;;
 	test)    send_test "${2:-}" "${3:-}" ;;
 	status)  status ;;

@@ -61,7 +61,9 @@ docker compose up -d --build
 # sends from. The domain's DKIM key is generated and the DNS records printed.
 docker compose exec relay remit project add myapp example.com
 
-# Once DNS has propagated:
+# Check the server (hostname, reverse DNS, port 25, blocklists) and, once DNS
+# has propagated, the project's records:
+docker compose exec relay remit doctor
 docker compose exec relay remit project show myapp
 ```
 
@@ -113,6 +115,7 @@ remit route set <domain> <host>[:port] [<user>] [--sign]   deliver a domain thro
 remit route remove <domain>       deliver it directly again
 remit route list
 
+remit doctor                      server checks: hostname, reverse DNS, port 25, blocklists
 remit test <from> <to>            send a signed test message
 remit status                      queue, domains, senders
 remit render                      rebuild tables from state (normally automatic)
@@ -140,7 +143,8 @@ And once for the server:
    `REMIT_HOSTNAME`, but it must exist.
 6. **Outbound port 25** open, or `REMIT_RELAYHOST` configured.
 
-`remit domain check <domain>` verifies 1–3. See [docs/deliverability.md](docs/deliverability.md),
+`remit doctor` verifies 4–6 and the blocklists; `remit domain check <domain>`
+verifies 1–3. See [docs/deliverability.md](docs/deliverability.md),
 [docs/connecting-a-project.md](docs/connecting-a-project.md) and [docs/routes.md](docs/routes.md).
 
 ## Configuration

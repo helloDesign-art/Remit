@@ -8,6 +8,8 @@ Each stage is usable on its own. Nothing here is a promise of dates.
   ownership enforcement, abuse limits, private binding, `remit` CLI.
 - Routes: deliver a domain through an external provider (Google Workspace,
   SES...) with TLS required, or everything through one upstream relay.
+- `remit doctor`: server-level checks (hostname, reverse DNS, outbound port
+  25, blocklists) and `remit domain check` for the DNS of each domain.
 
 ## v0.2 — API
 
@@ -22,7 +24,9 @@ Each stage is usable on its own. Nothing here is a promise of dates.
 
 ## v0.3 — Dashboard
 
-- Domains: add, verify DNS live, rotate DKIM keys.
+- Domains: add, verify DNS live (a "verify" button per record), rotate DKIM keys.
+- DNS automation: with a Cloudflare API token, `remit project add` publishes
+  the records itself; other providers behind the same interface later.
 - Projects and API keys / SMTP credentials.
 - Message log with status, headers and rendered preview.
 - Simple, fast UI; dark and light; no build step heavier than the API itself.

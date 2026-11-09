@@ -183,6 +183,11 @@ compose.yml     one-service deployment
 docs/           deliverability and integration notes
 ```
 
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md)
+for how to run the test suite and what a good change looks like.
+
 ## License
 
-To be announced with the first public release.
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

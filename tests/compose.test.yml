@@ -1,0 +1,5 @@
+# Overrides for tests/run.sh: a separate image tag so a test build never
+# replaces the image a production stack on the same machine is using.
+services:
+  relay:
+    image: remit/relay:test

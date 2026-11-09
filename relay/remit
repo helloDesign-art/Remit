@@ -10,6 +10,9 @@
 #   remit sender passwd <login>        rotate a password
 #   remit sender list
 #   remit sender remove <login>
+#   remit route set <domain> <host>[:port] [<user>]   deliver a domain through a provider (Google, SES...)
+#   remit route remove <domain>        deliver the domain directly again
+#   remit route list
 #   remit render                       rebuild Postfix/OpenDKIM tables from the state and reload
 #   remit test <from> <to>             send a signed test message
 #   remit status                       queue, domains, senders
@@ -26,6 +29,7 @@ SENDERS_FILE="$STATE/senders"
 REALM_FILE="$STATE/realm"
 SASLDB="$STATE/sasldb2"
 KEYS_DIR="$STATE/keys"
+ROUTES_DIR="$STATE/routes"
 SELECTOR="${REMIT_DKIM_SELECTOR:-remit}"
 
 die()  { printf 'remit: %s\n' "$*" >&2; exit 1; }
@@ -36,13 +40,22 @@ note() { printf '%s\n' "$*"; }
 # ----------------------------------------------------------------------------
 
 init_state() {
-	mkdir -p "$KEYS_DIR" "$STATE/postfix" "$STATE/opendkim"
+	mkdir -p "$KEYS_DIR" "$ROUTES_DIR" "$STATE/postfix" "$STATE/opendkim"
 	touch "$DOMAINS_FILE" "$SENDERS_FILE"
 	if [ ! -s "$REALM_FILE" ]; then
 		[ -n "${REMIT_HOSTNAME:-}" ] || die "REMIT_HOSTNAME is not set"
 		printf '%s\n' "$REMIT_HOSTNAME" > "$REALM_FILE"
 	fi
-	chmod 700 "$KEYS_DIR"
+	chmod 700 "$KEYS_DIR" "$ROUTES_DIR"
+}
+
+# Routes: one file per domain in $ROUTES_DIR with key=value lines
+# (relay=[host]:port, user=, password=, sign=yes|no).
+route_get() { # domain key
+	[ -f "$ROUTES_DIR/$1" ] && sed -n "s/^$2=//p" "$ROUTES_DIR/$1" | head -1 || true
+}
+domain_signs() { # a domain is signed unless its route says sign=no
+	[ "$(route_get "$1" sign)" != "no" ]
 }
 
 realm() { cat "$REALM_FILE"; }
@@ -95,7 +108,8 @@ render() {
 		printf '%s._domainkey.%s %s:%s:%s/%s/%s.private\n' \
 			"$SELECTOR" "$dom" "$dom" "$SELECTOR" "$KEYS_DIR" "$dom" "$SELECTOR" >> "$STATE/opendkim/KeyTable.tmp"
 		# refile: keys are glob-style patterns where "*" matches anything.
-		printf '*@%s %s._domainkey.%s\n' \
+		# Domains routed through a provider that signs for them are left out.
+		domain_signs "$dom" && printf '*@%s %s._domainkey.%s\n' \
 			"$dom" "$SELECTOR" "$dom" >> "$STATE/opendkim/SigningTable.tmp"
 	done < "$DOMAINS_FILE"
 	mv "$STATE/opendkim/KeyTable.tmp" "$STATE/opendkim/KeyTable"
@@ -120,12 +134,39 @@ render() {
 	' "$SENDERS_FILE" | sort > "$STATE/postfix/sender_login.tmp"
 	mv "$STATE/postfix/sender_login.tmp" "$STATE/postfix/sender_login"
 
+	# Routes: relayhost, credentials and TLS policy per sender domain, plus the
+	# optional global upstream relay from the environment.
+	: > "$STATE/postfix/sender_relay.tmp"
+	: > "$STATE/postfix/sender_passwd.tmp"
+	: > "$STATE/postfix/tls_policy.tmp"
+	local rf rdom relay ruser rpass
+	for rf in "$ROUTES_DIR"/*; do
+		[ -f "$rf" ] || continue
+		rdom="$(basename "$rf")"
+		relay="$(route_get "$rdom" relay)"; ruser="$(route_get "$rdom" user)"; rpass="$(route_get "$rdom" password)"
+		[ -n "$relay" ] || continue
+		printf '@%s %s\n' "$rdom" "$relay" >> "$STATE/postfix/sender_relay.tmp"
+		[ -n "$ruser" ] && printf '@%s %s:%s\n' "$rdom" "$ruser" "$rpass" >> "$STATE/postfix/sender_passwd.tmp"
+		printf '%s encrypt\n' "$relay" >> "$STATE/postfix/tls_policy.tmp"
+	done
+	if [ -n "${REMIT_RELAYHOST:-}" ]; then
+		[ -n "${REMIT_RELAY_USER:-}" ] && printf '%s %s:%s\n' "$REMIT_RELAYHOST" "$REMIT_RELAY_USER" "${REMIT_RELAY_PASSWORD:-}" >> "$STATE/postfix/sender_passwd.tmp"
+		printf '%s encrypt\n' "$REMIT_RELAYHOST" >> "$STATE/postfix/tls_policy.tmp"
+	fi
+	sort -u "$STATE/postfix/tls_policy.tmp" > "$STATE/postfix/tls_policy.tmp2" && mv "$STATE/postfix/tls_policy.tmp2" "$STATE/postfix/tls_policy.tmp"
+	mv "$STATE/postfix/sender_relay.tmp" "$STATE/postfix/sender_relay"
+	mv "$STATE/postfix/sender_passwd.tmp" "$STATE/postfix/sender_passwd"
+	mv "$STATE/postfix/tls_policy.tmp" "$STATE/postfix/tls_policy"
+
 	# Permissions: keys for opendkim only, sasldb for postfix only, tables readable.
 	chown -R opendkim:opendkim "$KEYS_DIR" 2>/dev/null || true
 	find "$KEYS_DIR" -type f -name '*.private' -exec chmod 600 {} +
 	[ -f "$SASLDB" ] && { chown postfix:postfix "$SASLDB"; chmod 600 "$SASLDB"; }
 	chmod 644 "$STATE/opendkim"/* "$STATE/postfix"/*
-	chmod 600 "$STATE/postfix/relay_password" 2>/dev/null || true
+	# Provider passwords: root only. Postfix opens its tables before dropping
+	# privileges, so this is enough.
+	chmod 600 "$STATE/postfix/sender_passwd"
+	chmod 600 "$ROUTES_DIR"/* 2>/dev/null || true
 
 	if [ "$reload" = reload ]; then
 		if postfix status >/dev/null 2>&1; then
@@ -150,6 +191,19 @@ print_dns() {
 		spf_source="ip4:${REMIT_PUBLIC_IP}"
 	else
 		spf_source="a:$(realm)"
+	fi
+	local relay
+	relay="$(route_get "$d" relay)"
+	if [ -n "$relay" ] && ! domain_signs "$d"; then
+		cat <<-EOF
+
+			$d is delivered through ${relay}. That provider signs the mail and
+			must be in the domain's SPF record (for Google Workspace:
+			include:_spf.google.com). Remit adds no DKIM signature to it, so the
+			record below is only needed if you re-enable signing with
+			"remit route set $d ... --sign".
+
+		EOF
 	fi
 	cat <<-EOF
 
@@ -247,7 +301,9 @@ domain_list() {
 		[ -n "$d" ] || continue
 		local owners
 		owners="$(awk -v d="$d" '{ n=split($2,ds,","); for(i=1;i<=n;i++) if (ds[i]==d) printf "%s ", $1 }' "$SENDERS_FILE")"
-		printf '%-40s senders: %s\n' "$d" "${owners:-none}"
+		local via
+		via="$(route_get "$d" relay)"
+		printf '%-40s senders: %-24s via: %s\n' "$d" "${owners:-none}" "${via:-direct}"
 	done < "$DOMAINS_FILE"
 }
 
@@ -351,6 +407,74 @@ sender_remove() {
 }
 
 # ----------------------------------------------------------------------------
+# route
+# ----------------------------------------------------------------------------
+
+route_set() {
+	# remit route set <domain> <host>[:port] [<user>] [--sign]
+	local d="${1:-}" target="${2:-}" user="" sign=no arg
+	shift 2 2>/dev/null || true
+	for arg in "$@"; do
+		case "$arg" in
+			--sign) sign=yes ;;
+			--*) die "unknown option $arg" ;;
+			*) user="$arg" ;;
+		esac
+	done
+	[ -n "$d" ] && [ -n "$target" ] || die "usage: remit route set <domain> <host>[:port] [<user>] [--sign]"
+	d="${d,,}"
+	domain_exists "$d" || die "$d is not registered; run: remit domain add $d"
+	local host port
+	host="${target%%:*}"; port="${target##*:}"
+	[ "$port" = "$target" ] && port=587
+	[[ "$port" =~ ^[0-9]+$ ]] || die "'$port' is not a port"
+	host="${host#[}"; host="${host%]}"
+	valid_domain "$host" || die "'$host' is not a valid host name"
+	local password=""
+	if [ -n "$user" ]; then
+		if [ -t 0 ]; then
+			read -rsp "Password for $user at $host: " password; echo
+		else
+			IFS= read -r password || true
+		fi
+		[ -n "$password" ] || die "no password given (pass it on stdin when not interactive)"
+	fi
+	init_state
+	{
+		printf 'relay=[%s]:%s\n' "$host" "$port"
+		printf 'user=%s\n' "$user"
+		printf 'password=%s\n' "$password"
+		printf 'sign=%s\n' "$sign"
+	} > "$ROUTES_DIR/$d.tmp"
+	chmod 600 "$ROUTES_DIR/$d.tmp"
+	mv "$ROUTES_DIR/$d.tmp" "$ROUTES_DIR/$d"
+	render
+	note "$d is now delivered through [$host]:$port$( [ -n "$user" ] && echo " as $user" ), TLS required, DKIM by Remit: $sign"
+}
+
+route_remove() {
+	local d="${1:-}"
+	[ -n "$d" ] || die "usage: remit route remove <domain>"
+	d="${d,,}"
+	[ -f "$ROUTES_DIR/$d" ] || die "$d has no route"
+	rm -f "$ROUTES_DIR/$d"
+	render
+	note "$d is delivered directly again (signed by Remit)"
+}
+
+route_list() {
+	init_state
+	local rf d
+	local any=0
+	for rf in "$ROUTES_DIR"/*; do
+		[ -f "$rf" ] || continue
+		any=1; d="$(basename "$rf")"
+		printf '%-40s via %-32s user: %-20s dkim: %s\n' "$d" "$(route_get "$d" relay)" "$(route_get "$d" user | sed 's/^$/none (IP allowlist)/')" "$(route_get "$d" sign)"
+	done
+	[ "$any" = 1 ] || note "no routes; every domain is delivered directly"
+}
+
+# ----------------------------------------------------------------------------
 # test / status / health
 # ----------------------------------------------------------------------------
 
@@ -419,6 +543,13 @@ case "${1:-}" in
 			passwd) sender_passwd "${3:-}" ;;
 			list)   sender_list ;;
 			remove) sender_remove "${3:-}" ;;
+			*)      usage; exit 1 ;;
+		esac ;;
+	route)
+		case "${2:-}" in
+			set)    shift 2; route_set "$@" ;;
+			remove) route_remove "${3:-}" ;;
+			list)   route_list ;;
 			*)      usage; exit 1 ;;
 		esac ;;
 	render)  render "${2:-reload}" ;;

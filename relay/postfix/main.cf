@@ -93,6 +93,19 @@ delay_warning_time = 4h
 # TLS towards clients is configured by the entrypoint (REMIT_SUBMISSION_TLS).
 smtpd_tls_security_level = none
 
+# --- Routing per sender domain (`remit route`) -------------------------------
+# A domain without a route is delivered directly. A domain with a route is
+# handed to that provider (Google Workspace, SES, Mailgun...), authenticating
+# with the stored credentials; passwords are never sent without TLS.
+smtp_sender_dependent_authentication = yes
+sender_dependent_relayhost_maps = texthash:/var/lib/remit/postfix/sender_relay
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = texthash:/var/lib/remit/postfix/sender_passwd
+smtp_sasl_security_options = noplaintext, noanonymous
+smtp_sasl_tls_security_options = noanonymous
+smtp_sasl_mechanism_filter = plain, login
+smtp_tls_policy_maps = texthash:/var/lib/remit/postfix/tls_policy
+
 # --- Privacy ----------------------------------------------------------------
 # Drop the Received: line that would leak the internal address of the project
 # that submitted the message.

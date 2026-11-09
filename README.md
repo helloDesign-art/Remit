@@ -39,7 +39,10 @@ one server.
   per message, message size), all tunable.
 - **Clean headers.** The `Received:` line that would expose your internal
   container addresses is removed.
-- **Optional upstream relay** for hosts whose provider blocks outbound port 25.
+- **Routes per domain.** A domain can leave through a provider instead
+  (Google Workspace, SES, Mailgun...) while applications keep talking to Remit;
+  TLS is required and the provider's signature is used. Or send everything
+  through one upstream relay when the host blocks port 25.
 
 ## Quick start
 
@@ -95,6 +98,10 @@ remit sender passwd <login>       rotate a password
 remit sender list
 remit sender remove <login>
 
+remit route set <domain> <host>[:port] [<user>] [--sign]   deliver a domain through a provider
+remit route remove <domain>       deliver it directly again
+remit route list
+
 remit test <from> <to>            send a signed test message
 remit status                      queue, domains, senders
 remit render                      rebuild tables from state (normally automatic)
@@ -122,7 +129,8 @@ And once for the server:
    `REMIT_HOSTNAME`, but it must exist.
 6. **Outbound port 25** open, or `REMIT_RELAYHOST` configured.
 
-`remit domain check <domain>` verifies 1–3. See [docs/deliverability.md](docs/deliverability.md).
+`remit domain check <domain>` verifies 1–3. See [docs/deliverability.md](docs/deliverability.md),
+[docs/connecting-a-project.md](docs/connecting-a-project.md) and [docs/routes.md](docs/routes.md).
 
 ## Configuration
 
@@ -150,6 +158,8 @@ All settings are environment variables; see [`.env.example`](.env.example).
 - The relay is not reachable from the internet in the default configuration.
   If you bind it to a public address, enable TLS and firewall the port.
 - Passwords are stored hashed in a `sasldb`; Remit never shows them again.
+- Credentials for upstream providers are only ever sent over TLS; without it
+  the mail is deferred, not sent in clear.
 
 Report security issues privately to the maintainers (see
 [SECURITY.md](SECURITY.md)).

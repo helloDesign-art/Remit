@@ -38,18 +38,12 @@ else
 	postconf -e "smtpd_tls_security_level = none"
 fi
 
-# Optional upstream relay, for hosts whose provider blocks outbound port 25.
+# Optional upstream relay for everything, for hosts whose provider blocks
+# outbound port 25. Its credentials and TLS policy are written by `remit render`
+# together with the per-domain routes.
 if [ -n "${REMIT_RELAYHOST:-}" ]; then
 	postconf -e "relayhost = ${REMIT_RELAYHOST}"
-	if [ -n "${REMIT_RELAY_USER:-}" ]; then
-		printf '%s %s:%s\n' "$REMIT_RELAYHOST" "$REMIT_RELAY_USER" "${REMIT_RELAY_PASSWORD:-}" > "$STATE/postfix/relay_password"
-		chmod 600 "$STATE/postfix/relay_password"
-		postconf -e "smtp_sasl_auth_enable = yes" \
-		           "smtp_sasl_password_maps = texthash:$STATE/postfix/relay_password" \
-		           "smtp_sasl_security_options = noanonymous" \
-		           "smtp_tls_security_level = encrypt"
-	fi
-	log "relaying through ${REMIT_RELAYHOST}"
+	log "relaying everything through ${REMIT_RELAYHOST}"
 else
 	postconf -e "relayhost ="
 fi

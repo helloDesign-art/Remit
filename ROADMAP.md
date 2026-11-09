@@ -6,6 +6,8 @@ Each stage is usable on its own. Nothing here is a promise of dates.
 
 - Send-only Postfix, DKIM per domain, SASL login per project, sender
   ownership enforcement, abuse limits, private binding, `remit` CLI.
+- Routes: deliver a domain through an external provider (Google Workspace,
+  SES...) with TLS required, or everything through one upstream relay.
 
 ## v0.2 — API
 
